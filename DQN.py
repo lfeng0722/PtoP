@@ -12,9 +12,13 @@ Transition = namedtuple("Transition", ("state", "action", "reward", "next_state"
 
 class QNetwork(nn.Module):
     """
-    简单 MLP 做 Q(s,a) 的近似:
-    - 输入: obs_dim
-    - 输出: n_actions 维 Q 值
+    Shallow MLP approximating the Q-function Q(s, a).
+
+    Args:
+        obs_dim: Dimensionality of the observation vector.
+        n_actions: Number of discrete actions (output heads).
+        hidden: Tuple of (h1, h2) hidden layer sizes.
+        dropout: Dropout probability applied after the first hidden layer.
     """
     def __init__(self, obs_dim: int, n_actions: int, hidden=(128, 128), dropout=0.0):
         super().__init__()
@@ -88,22 +92,27 @@ class DQNAgent:
         self.optim = torch.optim.Adam(self.q_net.parameters(), lr=lr)
         self.replay = ReplayBuffer(replay_capacity)
 
-        # epsilon 调度
+        # Epsilon-greedy schedule parameters.
         self.eps_start = eps_start
         self.eps_end = eps_end
         self.eps_decay_steps = eps_decay_steps
         self.total_steps = 0
 
     def epsilon(self):
-        # 线性衰减
+        # Linear decay from eps_start to eps_end over eps_decay_steps.
         t = min(self.total_steps, self.eps_decay_steps)
         return self.eps_end + (self.eps_start - self.eps_end) * (1.0 - t / self.eps_decay_steps)
 
     @torch.no_grad()
     def select_action(self, obs_np: np.ndarray):
         """
-        obs_np: (obs_dim,) 的 numpy 向量
-        返回: 动作索引 int
+        Select an action using an epsilon-greedy policy.
+
+        Args:
+            obs_np: Observation vector of shape (obs_dim,).
+
+        Returns:
+            Action index as an int.
         """
         self.total_steps += 1
         if random.random() < self.epsilon():
@@ -122,7 +131,7 @@ class DQNAgent:
         self.replay.push(s_t, a_t, r_t, s2_t, d_t)
 
     def optimize(self):
-        if len(self.replay) < max(self.batch_size, 2048):  # 先热身
+        if len(self.replay) < max(self.batch_size, 2048):  # Warm-up: wait until buffer has enough samples.
             return None
 
         batch = self.replay.sample(self.batch_size)
@@ -137,7 +146,7 @@ class DQNAgent:
         q_sa = q.gather(1, action_b.view(-1, 1)).squeeze(1)         # [B]
 
         with torch.no_grad():
-            # Double DQN: 用在线网络选动作，用 target 网络估值
+            # Double DQN: online network selects the action; target network estimates its value.
             next_q_online = self.q_net(next_state_b)                # [B, A]
             next_a = torch.argmax(next_q_online, dim=1, keepdim=True)  # [B,1]
             next_q_target = self.target_net(next_state_b)           # [B, A]
@@ -151,7 +160,7 @@ class DQNAgent:
         nn.utils.clip_grad_norm_(self.q_net.parameters(), self.grad_clip)
         self.optim.step()
 
-        # 更新 target
+        # Periodically copy online weights into the target network.
         if (self.total_steps % self.target_update_interval) == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
 

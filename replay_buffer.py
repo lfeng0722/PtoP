@@ -1,12 +1,19 @@
 # replay_buffer.py
-# 轻量 near-miss 样本库（为分布采样与统计服务）
+# Lightweight near-miss sample buffer for distribution-based sampling and statistics.
 
 import random
 
 class NearMissReplay:
+    """
+    Fixed-capacity FIFO buffer storing near-miss scenario records.
+
+    Each record is a dict with keys: "ds", "dd", "dyaw", "F".
+    Capacity is enforced by evicting the oldest entry when the buffer is full.
+    """
+
     def __init__(self, capacity=50000):
         self.capacity = int(capacity)
-        self.data = []  # list of dict: {"ds","dd","dyaw","F"}
+        self.data = []  # list of dict: {"ds", "dd", "dyaw", "F"}
 
     def __len__(self):
         return len(self.data)

@@ -23,7 +23,7 @@ def sample_position_info(carla_map):
     }
 
 def _sanitize_position_info(pi: dict) -> dict:
-    # 兼容旧字段：surrounding_transforms -> surrounding_info
+    # Backward compatibility: migrate the legacy "surrounding_transforms" field to "surrounding_info".
     if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
         pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
         pi.pop('surrounding_transforms', None)
@@ -33,6 +33,17 @@ def _sanitize_position_info(pi: dict) -> dict:
 
 
 class seed_generator:
+    """
+    Generates scenario seeds (position_info dicts) using ART-style diversity maximization.
+
+    Maintains two sets:
+        candidate_seed_set: Freshly sampled candidates for the current iteration.
+        executed_seed_set:  Seeds that have already been executed and evaluated.
+
+    sample_seed() selects the candidate that maximizes minimum distance from
+    the executed set, implementing the Adaptive Random Testing diversity heuristic.
+    """
+
     def __init__(self, carla_map, candidate_size):
         self.carla_map = carla_map
         self.candidate_seed_set = []

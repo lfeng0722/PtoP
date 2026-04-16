@@ -1,4 +1,4 @@
-# offline_searcher.py —— 替换 CombinedGA 为此版本
+# offline_searcher.py — Defines CombinedGA for genetic-algorithm-based scenario search.
 import random
 import math
 import numpy as np
@@ -8,7 +8,7 @@ def _distance(loc1, loc2):
     return math.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2)
 
 def _sanitize_position_info(pi: dict) -> dict:
-    # 兼容旧字段：surrounding_transforms -> surrounding_info
+    # Backward compatibility: migrate the legacy "surrounding_transforms" field to "surrounding_info".
     if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
         pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
         pi.pop('surrounding_transforms', None)
@@ -44,6 +44,14 @@ def sample_action_info(vehicle_num, seq_len=50):
     return actions_per_vehicle
 
 class CombinedGA:
+    """
+    Genetic algorithm for searching adversarial scenario configurations.
+
+    Each individual encodes a position_info dict (ego + surrounding NPC transforms).
+    Fitness drives selection; mutation introduces diversity via maximum-distance resampling
+    relative to the accumulated safe_set.
+    """
+
     def __init__(self, carla_map, population_size=10, generations=5, seq_len=5, enable_action_ga=False):
         self.carla_map = carla_map
         self.safe_set = []
@@ -52,7 +60,7 @@ class CombinedGA:
         self.seq_len = seq_len
         self.enable_action_ga = enable_action_ga
 
-        self.population = []  # 每个元素: {"position_info": {...}, ["action_info": ...]}
+        self.population = []  # Each element: {"position_info": {...}, optionally "action_info": [...]}
         self.best_individual = None
         self.best_fitness = float('-inf')
 
@@ -66,19 +74,19 @@ class CombinedGA:
 
     def crossover_individuals(self, parent1, parent2, crossover_rate=0.8):
         if random.random() >= crossover_rate:
-            # 防守式清理一下两个父代的字段
+            # No crossover: return sanitized copies of both parents unchanged.
             return (
-                {"position_info": _sanitize_position_info(parent1["position_info"])},
-                {"position_info": _sanitize_position_info(parent2["position_info"])}
+                {“position_info”: _sanitize_position_info(parent1[“position_info”])},
+                {“position_info”: _sanitize_position_info(parent2[“position_info”])}
             )
 
-        p1 = _sanitize_position_info(parent1["position_info"])
-        p2 = _sanitize_position_info(parent2["position_info"])
+        p1 = _sanitize_position_info(parent1[“position_info”])
+        p2 = _sanitize_position_info(parent2[“position_info”])
 
         child1 = {'position_info': {}}
         child2 = {'position_info': {}}
 
-        # 交换“邻车集”和 ego 位姿
+        # Swap surrounding NPC sets while keeping each parent's ego transform.
         child1['position_info']['surrounding_info'] = p2['surrounding_info']
         child1['position_info']['vehicle_num'] = len(p2['surrounding_info'])
         child1['position_info']['ego_transform'] = p1['ego_transform']
@@ -90,9 +98,14 @@ class CombinedGA:
         return child1, child2
 
     def mutation(self, individual, mutation_rate=0.2):
-        # individual 是一个个体 dict
+        """
+        Mutate an individual by optionally replacing it with the most diverse candidate.
+
+        Samples 10 random candidates and selects the one with the greatest average
+        distance from safe_set, maximizing diversity in the search population.
+        """
         if random.random() < mutation_rate:
-            # 采样 10 个候选，选和 safe_set 差异最大的
+            # Sample 10 candidates and select the one farthest from safe_set.
             candidates = []
             scores = []
             for _ in range(10):
@@ -104,7 +117,7 @@ class CombinedGA:
                 scores.append(dist)
             return candidates[int(np.argmax(scores))]
         else:
-            # 仍然返回字段已清理的个体
+            # No mutation: return a sanitized copy of the original individual.
             out = {"position_info": _sanitize_position_info(individual["position_info"])}
             return out
 

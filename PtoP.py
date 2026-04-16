@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-主程序（完整可运行骨架，支持“车+人”双对象控制，修复行人 NaN 指令）：
-- GA 采样 + 代末 SVGD 微调（对 NPC 初始 (ds, dd, dyaw)）
-- ART 在线操控 NPC（自适应策略 + 组合动作）
-- MLP surrogate：输入 = 起点特征，标签 = episode 内 NPC 与 EGO 最近距离时刻的 hazard（min-distance 方案）
-- 在线每回合 1-2 epoch 微调；可选 EMA
-- 新增：WalkerPlanner（行人对抗控制，积分器 + 软最小距离）
-- 修复：行人每 tick 下发控制 & 兜底净化，梯度/参数裁剪，防止 NaN 扩散
-"""
+“””
+Main entry point for the PtoP adversarial testing framework.
+Supports dual-object adversarial control (vehicles + pedestrians) with NaN-safe
+walker command handling. Pipeline overview:
+- Seed sampling with GA + end-of-generation SVGD refinement of NPC initial (ds, dd, dyaw).
+- Online ART NPC control (adaptive policy + combined actions).
+- MLP surrogate: input = initial-pose features, label = hazard at minimum-distance
+  moment within an episode (min-distance scheme).
+- Online per-episode 1-2 epoch fine-tuning; optional EMA.
+- WalkerPlanner: adversarial pedestrian control via an integrator + soft min-distance loss.
+- NaN safety: walker control issued every tick with sanitization, gradient/parameter clipping.
+“””
 
 import os
 import cv2
@@ -19,9 +22,8 @@ import random
 import numpy as np
 from queue import Queue
 import torch
-from datetime import datetime
-import torch
 import torch.nn as nn
+from datetime import datetime
 import carla
 
 from utility import (
@@ -35,9 +37,9 @@ from ART_SEED_GENERATOR import seed_generator
 from npc_svgd_runtime import RuntimeNPCSVGD
 
 
-K_ATTACK = 3      # 对抗 NPC 数（车与人各自最多 K 个）
+K_ATTACK = 3      # Maximum number of adversarial NPCs (vehicles and pedestrians each).
 
-# —— 车辆规划器参数 —— #
+# —— Vehicle planner parameters —— #
 REPLAN_STRIDE = 5
 H = 25
 DT_PLAN = 0.10
@@ -50,15 +52,15 @@ W_U = 1e-3
 W_DU = 5e-3
 V_MIN, V_MAX = 0.0, 25.0
 
-# —— 行人规划器参数 —— #
-V_W_MAX = 2.2
+# —— Walker planner parameters —— #
+V_W_MAX = 2.2             # Maximum pedestrian speed (m/s); approximate fast walking pace.
 W_W = 1e-3
 W_DW = 5e-3
-LR_WALKER = 5e-3          # FIX: 更稳的学习率
-U_CLAMP_ABS = 4.0         # FIX: 每步后裁剪 U，防止爆炸
-GRAD_CLIP_NORM = 10.0     # FIX: 梯度裁剪
+LR_WALKER = 5e-3          # Stable learning rate for the walker planner.
+U_CLAMP_ABS = 4.0         # Per-step clamp on U to prevent divergence.
+GRAD_CLIP_NORM = 10.0     # Gradient clipping norm.
 
-# ====================== 几何/辅助 ======================
+# ====================== Geometry / utility helpers ======================
 def _yaw_to_unit(yaw_deg: float):
     r = math.radians(yaw_deg)
     return math.cos(r), math.sin(r)
@@ -79,7 +81,7 @@ def to_state(actor: carla.Actor):
                      math.radians(tf.rotation.yaw), v], dtype=np.float32)
 
 def to_state_walker(actor: carla.Actor):
-    """行人也返回 (x,y,yaw,v)，yaw 用速度方向或朝向近似。"""
+    """Return (x, y, yaw, v) for a pedestrian; yaw is approximated from velocity direction."""
     tf = actor.get_transform()
     vel = actor.get_velocity()
     vx, vy, vz = vel.x, vel.y, vel.z
@@ -100,7 +102,7 @@ def constant_velocity_rollout(x0_np, H, dt):
         xs.append(x[None, :])
     return torch.cat(xs, dim=0)  # [H+1, 4]
 
-# ====================== 可微 Kinematic Bicycle（车辆） ======================
+# ====================== Differentiable kinematic bicycle model (vehicle) ======================
 class KinematicBicycle(nn.Module):
     def __init__(self, L=2.7):
         super().__init__()
@@ -126,7 +128,7 @@ class KinematicBicycle(nn.Module):
             x = x_next
         return torch.cat(X, dim=0)
 
-# ====================== 可微积分器（行人） ======================
+# ====================== Differentiable integrator (pedestrian) ======================
 class WalkerIntegrator(nn.Module):
     def __init__(self, vmax=V_W_MAX):
         super().__init__()
@@ -134,9 +136,11 @@ class WalkerIntegrator(nn.Module):
 
     def forward(self, x0, U, dt):
         """
-        x0: [4]=(x,y,theta,v)
-        U : [H,2] 原始可训练量（无界），内部用 tanh 压到 [-1,1] 再乘 vmax 得到 (vx,vy)
-        return X:[H+1,4]（仅更新 x,y；theta 来源于速度方向；v 为速度范数）
+        x0: [4] = (x, y, theta, v)
+        U:  [H, 2] unbounded trainable parameters; tanh-squashed to [-1, 1] then
+            scaled by vmax to yield (vx, vy).
+        Returns X: [H+1, 4] — only x and y are updated; theta comes from velocity
+        direction; v is the velocity magnitude.
         """
         X = [x0[None, :]]
         x = x0
@@ -154,7 +158,7 @@ class WalkerIntegrator(nn.Module):
             x = x_next
         return torch.cat(X, dim=0)
 
-# ====================== 共同代价 ======================
+# ====================== Shared cost functions ======================
 def softmin_distance(npc_traj, ego_traj, tau=1.0):
     diff = npc_traj[:, :2] - ego_traj[:, :2]
     d = torch.sqrt(torch.sum(diff*diff, dim=1) + 1e-9)  # [H+1]
@@ -172,7 +176,7 @@ def control_regularizer_walker(U):
     loss_du = (torch.tanh(dU)**2).mean()
     return W_W*loss_u + W_DW*loss_du
 
-# ====================== 车辆规划器 ======================
+# ====================== Vehicle planner ======================
 class KingPlanner:
     def __init__(self, horizon=H, dt=DT_PLAN, n_opt=N_OPT, lr=LR, device="cpu"):
         self.horizon = horizon
@@ -200,9 +204,9 @@ class KingPlanner:
             npc_traj = self.model(npc_x0_t, U, self.dt)
             J = softmin_distance(npc_traj, ego_traj, tau=TAU_SOFTMIN) + control_regularizer(U)
             if not torch.isfinite(J):
-                J = (U**2).mean()  # 防 NaN
+                J = (U**2).mean()  # NaN guard: fall back to L2 regularization.
             J.backward()
-            torch.nn.utils.clip_grad_norm_([U], GRAD_CLIP_NORM)  # 虽是单参数，也可裁剪
+            torch.nn.utils.clip_grad_norm_([U], GRAD_CLIP_NORM)  # Clip even single-parameter tensors.
             opt.step()
             with torch.no_grad():
                 U.data.clamp_(-U_CLAMP_ABS, U_CLAMP_ABS)
@@ -224,7 +228,7 @@ def apply_king_control(actor: carla.Vehicle, a: float, delta: float):
     ctrl = carla.VehicleControl(throttle=throttle, brake=brake, steer=steer_cmd)
     actor.apply_control(ctrl)
 
-# ====================== 行人规划器 ======================
+# ====================== Walker planner ======================
 class WalkerPlanner:
     def __init__(self, horizon=H, dt=DT_PLAN, n_opt=N_OPT, lr=LR_WALKER, device="cpu", vmax=V_W_MAX):
         self.horizon = horizon
@@ -253,20 +257,20 @@ class WalkerPlanner:
             traj = self.model(w_x0_t, U, self.dt)
             J = softmin_distance(traj, ego_traj, tau=TAU_SOFTMIN) + control_regularizer_walker(U)
             if not torch.isfinite(J):
-                J = (torch.tanh(U)**2).mean()  # 防 NaN
+                J = (torch.tanh(U)**2).mean()  # NaN guard: fall back to L2 regularization.
             J.backward()
-            torch.nn.utils.clip_grad_norm_([U], GRAD_CLIP_NORM)         # FIX: 梯度裁剪
+            torch.nn.utils.clip_grad_norm_([U], GRAD_CLIP_NORM)         # Gradient clipping.
             opt.step()
             with torch.no_grad():
                 if not torch.isfinite(U).all():
-                    U.data.zero_()                                      # FIX: 立即回退
-                U.data.clamp_(-U_CLAMP_ABS, U_CLAMP_ABS)                # FIX: 限幅
+                    U.data.zero_()                                      # Immediate reset on NaN/Inf.
+                U.data.clamp_(-U_CLAMP_ABS, U_CLAMP_ABS)                # Clamp to prevent overflow.
 
         self.prev_plan[walker_id] = U.detach()
         with torch.no_grad():
             u0 = torch.tanh(self.prev_plan[walker_id][0]).cpu().numpy() * V_W_MAX
         vx, vy = float(u0[0]), float(u0[1])
-        # 返回可能仍需在外层净化（见主循环）
+        # Caller is responsible for sanitizing vx/vy before use (see main loop).
         return vx, vy
 
 def _sanitize_vec_towards_ego(walker: carla.Actor, ego: carla.Actor, wanted_speed=1.4):
@@ -280,17 +284,17 @@ def _sanitize_vec_towards_ego(walker: carla.Actor, ego: carla.Actor, wanted_spee
     return vx, vy
 
 def _clean_v(vx, vy, walker: carla.Actor, ego: carla.Actor):
-    """FIX: 统一净化：非有限/过大/过小 => 指向 EGO 的安全速度向量"""
+    """Sanitize walker velocity: replace non-finite/too-large/too-small values with a safe ego-directed vector."""
     if (not math.isfinite(vx)) or (not math.isfinite(vy)) or abs(vx) > 1e3 or abs(vy) > 1e3 or (abs(vx)+abs(vy) < 1e-3):
         return _sanitize_vec_towards_ego(walker, ego, wanted_speed=min(1.6, V_W_MAX))
-    # 限幅（再保险）
+    # Clamp to V_W_MAX as a final safety check.
     sp = math.hypot(vx, vy)
     if sp > V_W_MAX + 1e-6:
         vx, vy = vx / sp * V_W_MAX, vy / sp * V_W_MAX
     return vx, vy
 
 def apply_walker_control(actor: carla.Actor, vx: float, vy: float):
-    # 若仍然不干净，直接停下
+    # If still non-finite, stop the walker.
     if not (math.isfinite(vx) and math.isfinite(vy)):
         vx, vy = 0.0, 0.0
     speed = float(np.hypot(vx, vy))
@@ -306,7 +310,7 @@ def apply_walker_control(actor: carla.Actor, vx: float, vy: float):
     actor.apply_control(ctrl)
 
 def try_stop_walker_ai(demo: MultiVehicleDemo, walker: carla.Actor):
-    """尝试停止行人 AI 控制器，兼容多种封装结构。"""
+    """Attempt to stop the walker AI controller, compatible with multiple wrapper structures."""
     try:
         if hasattr(demo, "walker_controller_by_id"):
             ctrl = getattr(demo, "walker_controller_by_id").get(walker.id, None)
@@ -335,7 +339,7 @@ def try_stop_walker_ai(demo: MultiVehicleDemo, walker: carla.Actor):
     except Exception:
         pass
 
-# ====================== 全局超参数 ======================
+# ====================== Global hyperparameters ======================
 TIME_STEP = 0.05
 population_size = 10
 
@@ -372,7 +376,7 @@ SBART_STEPS_BASE = {
 }
 DEFAULT_STEPS = 6
 
-# ====================== 回放记录器 ======================
+# ====================== Episode recorder ======================
 class EpisodeRecorder:
     def __init__(self, world_map):
         self.map = world_map
@@ -393,7 +397,7 @@ class EpisodeRecorder:
             npcs[a.id] = {"tf": a.get_transform(), "vel": self._vel_of(a)}
         self.frames.append({"ego": {"tf": ego_tf, "vel": ego_vel}, "npcs": npcs})
 
-# ====================== hazard 计算/训练（保持不变） ======================
+# ====================== Hazard computation and MLP training ======================
 def _closing_speed_at(ego_tf, ego_vel, npc_tf, npc_vel):
     rx = npc_tf.location.x - ego_tf.location.x
     ry = npc_tf.location.y - ego_tf.location.y
@@ -520,7 +524,7 @@ def train_mlp_initial_pose_minDist(surrogate_mlp: NPCHazardMLPSurrogate,
     avg_loss = running / max(total_steps, 1)
     return total_steps, avg_loss, len(Y), (X, Y, META)
 
-# ====================== 主程序 ======================
+# ====================== Main program ======================
 def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(10.0)
@@ -581,18 +585,18 @@ def main():
 
         success = demo.setup_vehicles_with_collision(pos_info)
         if not success:
-            print("[ERROR] 车辆/行人生成失败，跳过（不计入有效回合）。")
+            print("[ERROR] Vehicle/pedestrian spawn failed; skipping (not counted as a valid episode).")
             continue
 
         actual_n = len(demo.vehicles) + len(demo.pedestrians)
         if actual_n < MIN_NPC:
-            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), 回滚重采样。")
+            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}); rolling back and resampling.")
             demo.destroy_all()
             continue
 
-        print(f"[INFO] 请求 {pos_info.get('vehicle_num','?')}，实际生成 {actual_n} (有效回合序号 {number_game})")
+        print(f"[INFO] Requested {pos_info.get('vehicle_num','?')}, spawned {actual_n} (valid episode #{number_game})")
 
-        # 车辆控制器记录（若有）
+        # Build controller lookup for NPC vehicles (if any).
         controllers = []
         controller_by_actor_id = {}
         for i, v in enumerate(demo.vehicles):
@@ -604,7 +608,7 @@ def main():
             demo.ego_vehicle.set_autopilot(True, tm.get_port())
             tm.vehicle_percentage_speed_difference(demo.ego_vehicle, 5)
 
-        # 非对抗车辆挂 TM
+        # Register non-adversarial vehicles with the traffic manager.
         ego_id = demo.ego_vehicle.id if demo.ego_vehicle is not None else -1
         for v in demo.vehicles:
             if v.id != ego_id:
@@ -615,7 +619,7 @@ def main():
                 tm.ignore_walkers_percentage(v, 0)
                 tm.distance_to_leading_vehicle(v, 2.5)
 
-        # 录像
+        # Camera recording setup.
         if RECORDING:
             camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
             camera_bp.set_attribute('image_size_x', '640')
@@ -641,7 +645,7 @@ def main():
             camera = None
             image_queue = None
 
-        # === 选择对抗对象（车 + 人），按 |s| 最小 ===
+        # === Select adversarial targets (vehicles + pedestrians) by smallest |s| (closest ahead) ===
         ego_tf0 = demo.ego_vehicle.get_transform()
         veh_scored = []
         for v in demo.vehicles:
@@ -658,16 +662,16 @@ def main():
         ped_scored.sort(key=lambda x: x[0])
         attack_walkers = [w for _, w in ped_scored[:min(K_ATTACK, len(ped_scored))]]
 
-        # 对抗车辆退出 TM
+        # Remove adversarial vehicles from traffic manager control.
         for v in attack_vehicles:
             v.set_autopilot(False)
 
-        # 对抗行人：尝试停止 AI 控制器，清一次控制
+        # Stop walker AI controllers and zero out their initial command.
         for w in attack_walkers:
             try_stop_walker_ai(demo, w)
             w.apply_control(carla.WalkerControl(direction=carla.Vector3D(0.0, 0.0, 0.0), speed=0.0))
 
-        # 行人上一帧控制缓存
+        # Cache for the previous walker command (used on non-planning steps).
         last_walker_cmd = {w.id: (0.0, 0.0) for w in attack_walkers}
 
         wall_start = time.monotonic()
@@ -676,13 +680,13 @@ def main():
         timeout_cnt = 0
         start_loc = None
 
-        # 回放记录器
+        # Episode replay recorder.
         rec = EpisodeRecorder(world_map)
 
         for mod in demo.modules:
             demo.enable_module(mod)
 
-        # ========== 主循环 ==========
+        # ========== Main loop ==========
         for step in range(100000):
             world.wait_for_tick()
 
@@ -690,12 +694,12 @@ def main():
                 print(f"[EARLY-EXIT] wall-clock > {EPISODE_MAX_SECONDS}s")
                 break
 
-            # 启动阶段
+            # Startup phase: detect abnormal ego speed before the episode is underway.
             if step < STARTUP_STEPS:
                 ego_vel = demo.ego_vehicle.get_velocity()
                 speed_ego = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
                 if speed_ego > 5:
-                    print('[WARN] 启动阶段 EGO 速度异常，结束该轮。')
+                    print('[WARN] Abnormal ego speed during startup; ending this episode.')
                     abnormal_case = True
             if step == STARTUP_STEPS and demo.external_ads:
                 start_loc = demo.ego_vehicle.get_location()
@@ -704,20 +708,20 @@ def main():
                 demo.set_destination()
 
             if step > STARTUP_STEPS:
-                # TM 续权（非对抗车）
+                # Periodically renew traffic-manager autopilot for non-adversarial vehicles.
                 if step % KEEP_ALIVE_PERIOD == 0:
                     for v in demo.vehicles:
                         if v.id == ego_id or v in attack_vehicles:
                             continue
                         v.set_autopilot(True, tm.get_port())
 
-                # tick & 早退
+                # Step controllers and check for early-exit conditions.
                 signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
                 if ego_collision or all_collision:
-                    print("[EARLY-EXIT] 碰撞，结束回合。")
+                    print("[EARLY-EXIT] Collision detected; ending episode.")
                     break
 
-                # 录像帧
+                # Save camera frame if recording.
                 if RECORDING and image_queue is not None:
                     try:
                         frame = image_queue.get_nowait()
@@ -727,14 +731,14 @@ def main():
                     except Exception:
                         pass
 
-                # 记录回放（车+人）
+                # Log replay frame (vehicles + pedestrians).
                 try:
                     all_npcs = list(demo.vehicles) + list(demo.pedestrians)
                     rec.log(demo.ego_vehicle, all_npcs)
                 except Exception:
                     pass
 
-                # 无进展兜底
+                # No-progress fallback: end episode if ego stalls.
                 ego_loc = demo.ego_vehicle.get_location()
                 if progress_anchor_loc is not None:
                     moved = math.hypot(ego_loc.x - progress_anchor_loc.x, ego_loc.y - progress_anchor_loc.y)
@@ -746,7 +750,7 @@ def main():
                         timeout_cnt = 1
                         break
 
-                # 摄像机跟随
+                # Camera follows the ego vehicle.
                 spectator = world.get_spectator()
                 trans = demo.ego_vehicle.get_transform()
                 loc = trans.location
@@ -761,7 +765,7 @@ def main():
                     carla.Rotation(pitch=-20, yaw=yaw_deg)
                 ))
 
-                # 到达检测
+                # Destination detection.
                 if demo.ego_destination is not None:
                     near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
                     if step != 0 and demo.external_ads and near_dest:
@@ -772,40 +776,40 @@ def main():
                         print('pass destination error')
                         abnormal_case = True
 
-                # === 规划与控制 ===
+                # === Planning and control ===
                 if (step % REPLAN_STRIDE) == 0 and (attack_vehicles or attack_walkers):
                     ego_x0 = to_state(demo.ego_vehicle)
 
-                    # 车辆：重规划 + 下发
+                    # Vehicles: replan and apply control.
                     for v in attack_vehicles:
                         try:
                             a, delta = planner.plan_once(ego_x0, to_state(v), v.id)
                             apply_king_control(v, a, delta)
                         except Exception as e:
-                            print(f"[WARN] 车辆规划异常 veh {v.id}: {e}")
+                            print(f"[WARN] Vehicle planning error veh {v.id}: {e}")
                             v.set_autopilot(True, tm.get_port())
 
-                    # 行人：重规划 + 净化 + 下发
+                    # Walkers: replan, sanitize, and apply control.
                     for w in attack_walkers:
                         try:
                             vx, vy = walker_planner.plan_once(ego_x0, to_state_walker(w), w.id)
-                            vx, vy = _clean_v(vx, vy, w, demo.ego_vehicle)       # FIX: 净化
+                            vx, vy = _clean_v(vx, vy, w, demo.ego_vehicle)       # Sanitize output.
                             last_walker_cmd[w.id] = (vx, vy)
                             apply_walker_control(w, vx, vy)
                         except Exception as e:
-                            print(f"[WARN] 行人规划异常 walker {w.id}: {e}")
+                            print(f"[WARN] Walker planning error walker {w.id}: {e}")
                 else:
-                    # 非规划步：重复下发上一帧的行人控制（并再次净化）
+                    # Non-planning step: re-issue the previous walker command (re-sanitized).
                     for w in attack_walkers:
                         try:
                             vx0, vy0 = last_walker_cmd.get(w.id, (0.0, 0.0))
-                            vx, vy = _clean_v(vx0, vy0, w, demo.ego_vehicle)     # FIX: 再净化
+                            vx, vy = _clean_v(vx0, vy0, w, demo.ego_vehicle)     # Re-sanitize.
                             last_walker_cmd[w.id] = (vx, vy)
                             apply_walker_control(w, vx, vy)
                         except Exception:
                             pass
 
-                # 调试：每 20 tick 打印一次行人控制与位置
+                # Debug: print walker command and position every 20 ticks.
                 if (step % 20) == 0 and attack_walkers:
                     for w in attack_walkers:
                         try:
@@ -815,7 +819,7 @@ def main():
                         except Exception:
                             pass
 
-        # episode 尾：清空 apollo 的 prediction/planning 缓存（若有）
+        # End of episode: flush Apollo prediction/planning caches (if connected).
         try:
             apollo_clear_prediction_planning(times=3, interval=0.05)
         except Exception as e:
@@ -830,7 +834,7 @@ def main():
             except Exception:
                 pass
 
-        # 结束检查
+        # Post-episode checks.
         end_loc = demo.ego_vehicle.get_location()
         if start_loc is not None:
             distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
@@ -838,12 +842,12 @@ def main():
             distance_to_start = 0.0
         print('Moved distance: ', distance_to_start)
         if distance_to_start < 1:
-            print("[WARNING] EGO 起点与终点距离 < 1m，判定异常，不计入本代。")
+            print("[WARNING] Ego start-to-end distance < 1m; episode judged abnormal, not counted.")
             abnormal_case = True
 
         seed_gen.executed_seed_set.append(scenario_conf)
 
-        # 统计
+        # Update episode statistics.
         if not abnormal_case:
             abnormal_count = 0
             side_total += demo.side_collision_count_vehicle
@@ -888,7 +892,7 @@ def main():
             abnormal_count += 1
             if RECORDING and os.path.isdir(save_dir):
                 shutil.rmtree(save_dir)
-            print(f"[INFO] 本轮异常，已回滚重采样（不计入有效回合）。")
+            print(f"[INFO] Abnormal episode; rolled back and resampling (not counted as a valid episode).")
 
         demo.destroy_all()
 
@@ -897,7 +901,7 @@ def main():
                                        include_walkers=True, hard_teleport=True)
         print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
 
-    # ---- 结束统计 ----
+    # ---- Final statistics ----
     print('Side collision (ego×vehicle):', side_total)
     print('Ego vehicle object collision:', obj_collison_total)
     print('Time Out:', timeout_total)
