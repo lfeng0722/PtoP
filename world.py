@@ -54,7 +54,7 @@ def _assign_blame_ego(ego: "carla.Vehicle",
                       other: "carla.Actor",
                       world_map: "carla.Map",
                       event_normal_impulse: "carla.Vector3D") -> (bool, str):
-    “””
+    """
     Attribute collision fault to the ego vehicle.
 
     Returns: (ego_fault: bool, why: str)
@@ -66,7 +66,7 @@ def _assign_blame_ego(ego: "carla.Vehicle",
       3) r = c_ego / (c_ego + c_other).
       4) Assign ego fault if: impulse >= IMPULSE_MIN, c_ego >= threshold, and r >= ratio threshold
          (threshold is slightly relaxed for rear-end scenarios).
-    “””
+    """
     try:
         # Unit vector from ego toward the other actor.
         loc_e = ego.get_transform().location
@@ -75,7 +75,7 @@ def _assign_blame_ego(ego: "carla.Vehicle",
 
         # Closing speed components along the ego→other axis.
         spd_e, v_e = _spd_and_vec(ego)
-        if hasattr(other, “get_velocity”):
+        if hasattr(other, "get_velocity"):
             spd_o, v_o = _spd_and_vec(other)
         else:
             spd_o, v_o = 0.0, carla.Vector3D(0.0, 0.0, 0.0)
@@ -216,8 +216,8 @@ class MultiVehicleDemo:
 
     # ========== Helper methods ==========
 
-    def _is_npc_rear_end(self, ego: “carla.Vehicle”, npc: “carla.Vehicle”) -> bool:
-        “””
+    def _is_npc_rear_end(self, ego: "carla.Vehicle", npc: "carla.Vehicle") -> bool:
+        """
         Return True if the NPC appears to be rear-ending the ego vehicle.
 
         Conditions (all must hold):
@@ -225,7 +225,7 @@ class MultiVehicleDemo:
           - Lateral offset is within 0.4 * lane_width (roughly the same lane).
           - Heading difference <= 35 degrees (same direction of travel).
           - NPC is closing on ego (dv_f > 0.5 m/s).
-        “””
+        """
         try:
             ego_tf = ego.get_transform()
             npc_tf = npc.get_transform()
@@ -308,7 +308,7 @@ class MultiVehicleDemo:
     # ========== Vehicle and pedestrian spawn logic ==========
 
     def setup_vehicles(self, scenario_conf):
-        “””
+        """
         Spawn all actors for the scenario.
 
         1) Spawn the ego vehicle at scenario_conf['ego_transform'].
@@ -317,7 +317,7 @@ class MultiVehicleDemo:
            - Pedestrian failure: resample from the navigation mesh until success.
         3) Write the final successful spawn transform back into scenario_conf to keep
            the scenario representation consistent with the actual simulation state.
-        “””
+        """
         world = self.world
         world_map = world.get_map()
         blueprint_library = world.get_blueprint_library()
@@ -660,9 +660,9 @@ class MultiVehicleDemo:
                         spawned_vehicle_count += 1
 
             except Exception as e:
-                print(f”[ERROR] Failed to spawn NPC[{i}]: {e}”)
+                print(f"[ERROR] Failed to spawn NPC[{i}]: {e}")
                 # Emergency fallback: retry until successful.
-                if npc_type == “pedestrian” and walker_bps:
+                if npc_type == "pedestrian" and walker_bps:
                     bp = random.choice(walker_bps)
                     while True:
                         loc = world.get_random_location_from_navigation()
@@ -714,7 +714,7 @@ class MultiVehicleDemo:
             try:
                 self.controllers[i] = LaneKeepAndChangeController(v)
             except Exception as e:
-                print(f”[WARN] Failed to create controller for veh[{i}] id={v.id}: {e}”)
+                print(f"[WARN] Failed to create controller for veh[{i}] id={v.id}: {e}")
 
         return True
 
@@ -837,18 +837,18 @@ class MultiVehicleDemo:
         return s, d
 
     def _assign_blame_ego(self,
-                          ego: “carla.Vehicle”,
-                          other: “carla.Actor”,
-                          world_map: “carla.Map”,
-                          event_normal_impulse: “carla.Vector3D”):
-        “””
+                          ego: "carla.Vehicle",
+                          other: "carla.Actor",
+                          world_map: "carla.Map",
+                          event_normal_impulse: "carla.Vector3D"):
+        """
         Return (ego_fault: bool, why: str).
 
         Compares each actor's closing-speed component along the ego→other axis.
         Ego is at fault when the impulse exceeds IMPULSE_MIN, the ego closing speed
         exceeds EGO_FAULT_CLOSE_SPEED_MIN, and ego's share of total closing speed
         exceeds EGO_FAULT_RATIO (relaxed by REAR_END_BONUS in rear-end cases).
-        “””
+        """
         try:
             # Unit vector pointing from ego to the other actor.
             loc_e = ego.get_transform().location
@@ -857,7 +857,7 @@ class MultiVehicleDemo:
 
             # Velocity approach components.
             _, v_e = self._spd_and_vec(ego)
-            if hasattr(other, “get_velocity”):
+            if hasattr(other, "get_velocity"):
                 _, v_o = self._spd_and_vec(other)
             else:
                 v_o = carla.Vector3D(0.0, 0.0, 0.0)
@@ -1041,13 +1041,13 @@ class MultiVehicleDemo:
     # ========== tick: step controllers and return signals ==========
 
     def tick(self):
-        “””
+        """
         Execute one simulation step.
 
         1) Calls LaneKeepAndChangeController.run_step() for every NPC vehicle.
         2) Checks whether the ego vehicle ran a red light.
         3) Returns (signals_list, ego_collision, collision, ego_cross_solid_line, ego_run_red_light).
-        “””
+        """
         signals_list = [None]*self.vehicle_num
         for i in range(self.vehicle_num):
             ctrl = self.controllers[i]
@@ -1062,7 +1062,7 @@ class MultiVehicleDemo:
         if not self.ego_run_red_light:
             if self._detect_run_red_light():
                 self.ego_run_red_light = True
-                print(“[INFO] Ego vehicle ran a red light.”)
+                print("[INFO] Ego vehicle ran a red light.")
 
         return signals_list, self.ego_collision, self.collision, self.ego_cross_solid_line, self.ego_run_red_light
 

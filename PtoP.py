@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-“””
-Main entry point for the PtoP adversarial testing framework.
-Supports dual-object adversarial control (vehicles + pedestrians) with NaN-safe
-walker command handling. Pipeline overview:
-- Seed sampling with GA + end-of-generation SVGD refinement of NPC initial (ds, dd, dyaw).
-- Online ART NPC control (adaptive policy + combined actions).
-- MLP surrogate: input = initial-pose features, label = hazard at minimum-distance
-  moment within an episode (min-distance scheme).
-- Online per-episode 1-2 epoch fine-tuning; optional EMA.
-- WalkerPlanner: adversarial pedestrian control via an integrator + soft min-distance loss.
-- NaN safety: walker control issued every tick with sanitization, gradient/parameter clipping.
-“””
+
+
+# Main entry point for the PtoP adversarial testing framework.
+# Supports dual-object adversarial control (vehicles + pedestrians) with NaN-safe
+# walker command handling. Pipeline overview:
+# - Seed sampling with GA + end-of-generation SVGD refinement of NPC initial (ds, dd, dyaw).
+# - Online ART NPC control (adaptive policy + combined actions).
+# - MLP surrogate: input = initial-pose features, label = hazard at minimum-distance
+#   moment within an episode (min-distance scheme).
+# - Online per-episode 1-2 epoch fine-tuning; optional EMA.
+# - WalkerPlanner: adversarial pedestrian control via an integrator + soft min-distance loss.
+# - NaN safety: walker control issued every tick with sanitization, gradient/parameter clipping.
+
 
 import os
 import cv2

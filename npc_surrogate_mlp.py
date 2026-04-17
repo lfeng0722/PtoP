@@ -4,7 +4,7 @@
 #    self.model is still used for training (backward-compatible with train_mlp_all_pairs).
 # 2) Provides ema_update(tau) and freeze_target(); call ema_update after each training phase
 #    to synchronize training weights into target_model with gradient stability.
-# 3) score_and_grad supports an optional “logit gradient” mode (use_logit_grad=True)
+# 3) score_and_grad supports an optional "logit gradient" mode (use_logit_grad=True)
 #    that strengthens gradient signal in extreme probability regions (default False).
 # 4) Map-derived features are clamped to reduce the effect of outliers on numerical stability.
 # 5) All inference paths use target_model.eval() with requires_grad=False, ensuring
@@ -192,7 +192,7 @@ class NPCHazardMLPSurrogate:
         return float(p)
 
     def score_and_grad(self, world_map, ego_tf, npc_tf, x_vec, h=0.5):  # h retained for call-signature compatibility; unused.
-        “””
+        """
         Compute hazard score and its gradient with respect to (ds, dd, dyaw_deg).
 
         Args:
@@ -203,7 +203,7 @@ class NPCHazardMLPSurrogate:
             (f, grad): f in [0, 1]; grad is the partial derivative w.r.t. (ds, dd, dyaw_deg).
             Only builds the computation graph w.r.t. x_vec; target_model parameters are frozen.
             When use_logit_grad=True, returns the gradient of logit(f) (clipped to prevent divergence).
-        “””
+        """
         # Differentiable input variables.
         ds = torch.tensor(float(x_vec[0]), dtype=torch.float32, device=self.device, requires_grad=True)
         dd = torch.tensor(float(x_vec[1]), dtype=torch.float32, device=self.device, requires_grad=True)

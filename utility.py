@@ -165,7 +165,7 @@ def run_all_actions_for_npcs(
     delay_s: float = 0.0,    # Optional pause between actions (alternatively use world.tick() in synchronous mode).
 ) -> None:
     if len(vehicle_list) != len(all_action_sequences):
-        raise ValueError(“vehicle_list and all_action_sequences must have the same length.”)
+        raise ValueError("vehicle_list and all_action_sequences must have the same length.")
 
     for veh, seq in zip(vehicle_list, all_action_sequences):
         # Execute the complete action sequence for the current vehicle.
@@ -321,14 +321,14 @@ def has_passed_destination(vehicle,
                           pass_ahead_m: float = 2.0,
                           require_same_lane: bool = True,
                           near_speed_mps: float = None):
-    “””
+    """
     Check whether the vehicle is near or has passed the destination.
 
     near   = straight-line distance to destination <= near_dist_m.
              Optionally also requires speed <= near_speed_mps when near_speed_mps is not None.
     passed = vehicle is ahead of the destination by at least pass_ahead_m along the road tangent,
              within lat_band_m lateral offset, and (optionally) on the same road/lane.
-    “””
+    """
     import math
     import carla
 
@@ -418,7 +418,7 @@ def _euclid2(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 def calculate_population_distance(pop1, pop2, alpha=1.0):
-    “””
+    """
     Compute a scalar distance between two population individuals (or their position_info dicts).
 
     The distance combines:
@@ -427,7 +427,7 @@ def calculate_population_distance(pop1, pop2, alpha=1.0):
       - Relative difference in NPC count (weighted by alpha).
 
     Supports both surrounding_info and the legacy surrounding_transforms field format.
-    “””
+    """
     ego1, surr1, n1 = _extract_xy_list(pop1)
     ego2, surr2, n2 = _extract_xy_list(pop2)
 
